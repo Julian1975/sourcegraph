@@ -31,6 +31,9 @@ const (
 	// site credential migration. It is defined in
 	// `1528395821_oob_site_credential_encryption_up.sql`.
 	BatchChangesSiteCredentialMigrationID = 10
+
+	// BatchChangesChangesetSpecsMigrationID is the ID of the changeset_specs migration.
+	BatchChangesChangesetSpecsMigrationID = 17
 )
 
 func RegisterMigrations(db database.DB, outOfBandMigrationRunner *oobmigration.Runner) error {
@@ -41,26 +44,29 @@ func RegisterMigrations(db database.DB, outOfBandMigrationRunner *oobmigration.R
 	}
 
 	// Initialize store.
-	cstore := store.New(db, observationContext, keyring.Default().BatchChangesCredentialKey)
+	bstore := store.New(db, observationContext, keyring.Default().BatchChangesCredentialKey)
 
 	// Register Batch Changes OOB migrations.
-	return Register(cstore, outOfBandMigrationRunner)
+	return Register(bstore, outOfBandMigrationRunner)
 }
 
 // Register registers all currently implemented out of band migrations
 // by batch changes with the migration runner.
-func Register(cstore *store.Store, outOfBandMigrationRunner *oobmigration.Runner) error {
+func Register(bstore *store.Store, outOfBandMigrationRunner *oobmigration.Runner) error {
 	allowDecrypt := os.Getenv("ALLOW_DECRYPT_MIGRATION") == "true"
 
 	migrations := map[int]oobmigration.Migrator{
-		BatchChangesSSHMigrationID: &sshMigrator{store: cstore},
+		BatchChangesSSHMigrationID: &sshMigrator{store: bstore},
 		BatchChangesUserCredentialMigrationID: &userCredentialMigrator{
-			store:        cstore,
+			store:        bstore,
 			allowDecrypt: allowDecrypt,
 		},
 		BatchChangesSiteCredentialMigrationID: &siteCredentialMigrator{
-			store:        cstore,
+			store:        bstore,
 			allowDecrypt: allowDecrypt,
+		},
+		BatchChangesChangesetSpecsMigrationID: &changesetSpecMigrator{
+			store: bstore,
 		},
 	}
 

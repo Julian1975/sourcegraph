@@ -35,12 +35,20 @@ var changesetSpecInsertColumns = []string{
 	"updated_at",
 	"fork_namespace",
 
-	// `external_id`, `head_ref`, `title` are (for now) write-only columns that
-	// contain normalized data from `spec` and are used for JOINs and WHERE
-	// conditions.
 	"external_id",
 	"head_ref",
 	"title",
+	"head_repo_id",
+	"base_rev",
+	"base_ref",
+	"body",
+	"published",
+	"diff",
+	"commit_message",
+	"commit_author_name",
+	"commit_author_email",
+	"type",
+	"migrated",
 }
 
 // changesetSpecColumns are used by the changeset spec related Store methods to
@@ -82,17 +90,85 @@ func (s *Store) CreateChangesetSpec(ctx context.Context, cs ...*btypes.Changeset
 				c.UpdatedAt = c.CreatedAt
 			}
 
-			var externalID, headRef, title *string
-			if c.Spec != nil {
-				if c.Spec.ExternalID != "" {
-					externalID = &c.Spec.ExternalID
+			// We don't want invalid specs to hit the normalized DB, so rather
+			// error here when we detect bad data, than in the DB migration later.
+			// We guard against this when they come in, but you never know.
+			if c.Spec.IsBranch() && c.Spec.BaseRepository != c.Spec.HeadRepository {
+				return errors.Wrap(batcheslib.ErrHeadBaseMismatch, "failed to migrate changeset spec to new DB schema")
+			}
+
+			var (
+				externalID        *string
+				headRef           *string
+				title             *string
+				baseRev           *string
+				baseRef           *string
+				body              *string
+				diff              *string
+				commitMessage     *string
+				commitAuthorName  *string
+				commitAuthorEmail *string
+				headRepoID        int32
+			)
+			if c.Spec.ExternalID != "" {
+				externalID = &c.Spec.ExternalID
+			}
+			if c.Spec.HeadRef != "" {
+				headRef = &c.Spec.HeadRef
+			}
+			if c.Spec.Title != "" {
+				title = &c.Spec.Title
+			}
+			if c.Spec.BaseRev != "" {
+				baseRev = &c.Spec.BaseRev
+			}
+			if c.Spec.BaseRef != "" {
+				baseRef = &c.Spec.BaseRef
+			}
+			if c.Spec.Body != "" {
+				body = &c.Spec.Body
+			}
+			if c.Spec.IsBranch() {
+				// We don't want invalid specs to hit the normalized DB, so rather
+				// error here when we detect bad data, than in the DB migration later
+				// where we will add non-null constraints and the likes.
+				d, err := c.Spec.Diff()
+				if err != nil {
+					return err
 				}
-				if c.Spec.HeadRef != "" {
-					headRef = &c.Spec.HeadRef
+				diff = &d
+
+				cm, err := c.Spec.CommitMessage()
+				if err != nil {
+					return err
 				}
-				if c.Spec.Title != "" {
-					title = &c.Spec.Title
+				commitMessage = &cm
+
+				can, err := c.Spec.AuthorName()
+				if err != nil {
+					return err
 				}
+				commitAuthorName = &can
+
+				cae, err := c.Spec.AuthorEmail()
+				if err != nil {
+					return err
+				}
+				commitAuthorEmail = &cae
+
+				headRepoID = int32(c.RepoID)
+			}
+
+			published, err := json.Marshal(c.Spec.Published)
+			if err != nil {
+				return err
+			}
+
+			var typ btypes.ChangesetSpecType
+			if c.Spec.IsBranch() {
+				typ = btypes.ChangesetSpecTypeBranch
+			} else {
+				typ = btypes.ChangesetSpecTypeExisting
 			}
 
 			if c.RandID == "" {
@@ -114,9 +190,22 @@ func (s *Store) CreateChangesetSpec(ctx context.Context, cs ...*btypes.Changeset
 				c.CreatedAt,
 				c.UpdatedAt,
 				c.ForkNamespace,
-				&dbutil.NullString{S: externalID},
-				&dbutil.NullString{S: headRef},
-				&dbutil.NullString{S: title},
+				dbutil.NullString{S: externalID},
+				dbutil.NullString{S: headRef},
+				dbutil.NullString{S: title},
+				nullInt32Column(headRepoID),
+				dbutil.NullString{S: baseRev},
+				dbutil.NullString{S: baseRef},
+				dbutil.NullString{S: body},
+				published,
+				dbutil.NullString{S: diff},
+				dbutil.NullString{S: commitMessage},
+				dbutil.NullString{S: commitAuthorName},
+				dbutil.NullString{S: commitAuthorEmail},
+				typ,
+				// Records created through this code path are always using the new
+				// schema, so mark it as migrated right away.
+				true,
 			); err != nil {
 				return err
 			}
@@ -140,6 +229,137 @@ func (s *Store) CreateChangesetSpec(ctx context.Context, cs ...*btypes.Changeset
 		inserter,
 	)
 }
+
+func (s *Store) MigrateChangesetSpec(ctx context.Context, spec *btypes.ChangesetSpec) (err error) {
+	ctx, _, endObservation := s.operations.migrateChangesetSpec.With(ctx, &err, observation.Args{LogFields: []log.Field{
+		log.Int64("ID", spec.ID),
+	}})
+	defer endObservation(1, observation.Args{})
+
+	// We don't want invalid specs to hit the normalized DB, so rather
+	// error here when we detect bad data, than in the DB migration later.
+	// We guard against this when they come in, but you never know.
+	if spec.Spec.IsBranch() && spec.Spec.BaseRepository != spec.Spec.HeadRepository {
+		return errors.Wrap(batcheslib.ErrHeadBaseMismatch, "failed to migrate changeset spec to new DB schema")
+	}
+
+	var (
+		externalID        *string
+		headRef           *string
+		title             *string
+		baseRev           *string
+		baseRef           *string
+		body              *string
+		diff              *string
+		commitMessage     *string
+		commitAuthorName  *string
+		commitAuthorEmail *string
+		headRepoID        int32
+	)
+	if spec.Spec.ExternalID != "" {
+		externalID = &spec.Spec.ExternalID
+	}
+	if spec.Spec.HeadRef != "" {
+		headRef = &spec.Spec.HeadRef
+	}
+	if spec.Spec.Title != "" {
+		title = &spec.Spec.Title
+	}
+	if spec.Spec.BaseRev != "" {
+		baseRev = &spec.Spec.BaseRev
+	}
+	if spec.Spec.BaseRef != "" {
+		baseRef = &spec.Spec.BaseRef
+	}
+	if spec.Spec.Body != "" {
+		body = &spec.Spec.Body
+	}
+	if spec.Spec.IsBranch() {
+		// We don't want invalid specs to hit the normalized DB, so rather
+		// error here when we detect bad data, than in the DB migration later
+		// where we will add non-null constraints and the likes.
+		d, err := spec.Spec.Diff()
+		if err != nil {
+			return err
+		}
+		diff = &d
+
+		cm, err := spec.Spec.CommitMessage()
+		if err != nil {
+			return err
+		}
+		commitMessage = &cm
+
+		can, err := spec.Spec.AuthorName()
+		if err != nil {
+			return err
+		}
+		commitAuthorName = &can
+
+		cae, err := spec.Spec.AuthorEmail()
+		if err != nil {
+			return err
+		}
+		commitAuthorEmail = &cae
+
+		headRepoID = int32(spec.RepoID)
+	}
+
+	published, err := json.Marshal(spec.Spec.Published)
+	if err != nil {
+		return err
+	}
+
+	var typ btypes.ChangesetSpecType
+	if spec.Spec.IsBranch() {
+		typ = btypes.ChangesetSpecTypeBranch
+	} else {
+		typ = btypes.ChangesetSpecTypeExisting
+	}
+
+	q := sqlf.Sprintf(
+		migrateChangesetSpecQueryFmtstr,
+		dbutil.NullString{S: externalID},
+		dbutil.NullString{S: headRef},
+		dbutil.NullString{S: title},
+		nullInt32Column(headRepoID),
+		dbutil.NullString{S: baseRev},
+		dbutil.NullString{S: baseRef},
+		dbutil.NullString{S: body},
+		published,
+		dbutil.NullString{S: diff},
+		dbutil.NullString{S: commitMessage},
+		dbutil.NullString{S: commitAuthorName},
+		dbutil.NullString{S: commitAuthorEmail},
+		typ,
+		spec.ID,
+	)
+
+	return s.Exec(ctx, q)
+}
+
+var migrateChangesetSpecQueryFmtstr = `
+-- source: enterprise/internal/batches/store_changeset_specs.go:MigrateChangesetSpec
+UPDATE
+	changeset_specs
+SET
+	external_id = %s,
+	head_ref = %s,
+	title = %s,
+	head_repo_id = %s,
+	base_rev = %s,
+	base_ref = %s,
+	body = %s,
+	published = %s,
+	diff = %s,
+	commit_message = %s,
+	commit_author_name = %s,
+	commit_author_email = %s,
+	type = %s,
+	migrated = TRUE
+WHERE
+	id = %s
+`
 
 // UpdateChangesetSpecBatchSpecID updates the given ChangesetSpecs to be owned by the given batch spec.
 func (s *Store) UpdateChangesetSpecBatchSpecID(ctx context.Context, cs []int64, batchSpec int64) (err error) {
@@ -313,6 +533,10 @@ type ListChangesetSpecsOpts struct {
 	RandIDs     []string
 	IDs         []int64
 	Type        batcheslib.ChangesetSpecDescriptionType
+
+	// RequiresMigration when true only returns changeset spec records that
+	// have not been migrated to the new normalized database schema.
+	RequiresMigration bool
 }
 
 // ListChangesetSpecs lists ChangesetSpecs with the given filters.
@@ -374,6 +598,10 @@ func listChangesetSpecsQuery(opts *ListChangesetSpecsOpts) *sqlf.Query {
 			// Check that externalID is empty.
 			preds = append(preds, sqlf.Sprintf("changeset_specs.external_id IS NULL"))
 		}
+	}
+
+	if opts.RequiresMigration {
+		preds = append(preds, sqlf.Sprintf("changeset_specs.migrated IS FALSE"))
 	}
 
 	return sqlf.Sprintf(

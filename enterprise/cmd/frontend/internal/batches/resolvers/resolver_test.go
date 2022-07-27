@@ -145,6 +145,7 @@ func TestCreateBatchSpec(t *testing.T) {
 		changesetSpecs[i] = &btypes.ChangesetSpec{
 			Spec: &batcheslib.ChangesetSpec{
 				BaseRepository: string(graphqlbackend.MarshalRepositoryID(repo.ID)),
+				ExternalID:     "123",
 			},
 			RepoID: repo.ID,
 			UserID: userID,
@@ -545,6 +546,7 @@ func TestApplyBatchChange(t *testing.T) {
 		BatchSpecID: batchSpec.ID,
 		Spec: &batcheslib.ChangesetSpec{
 			BaseRepository: string(repoAPIID),
+			ExternalID:     "123",
 		},
 		RepoID: repo.ID,
 		UserID: userID,

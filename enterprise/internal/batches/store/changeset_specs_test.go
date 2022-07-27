@@ -2,12 +2,15 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/graph-gophers/graphql-go/relay"
+	"github.com/keegancsmith/sqlf"
 
 	"github.com/sourcegraph/log/logtest"
 
@@ -16,6 +19,8 @@ import (
 	btypes "github.com/sourcegraph/sourcegraph/enterprise/internal/batches/types"
 	"github.com/sourcegraph/sourcegraph/internal/api"
 	"github.com/sourcegraph/sourcegraph/internal/database"
+	"github.com/sourcegraph/sourcegraph/internal/database/basestore"
+	"github.com/sourcegraph/sourcegraph/internal/database/dbutil"
 	"github.com/sourcegraph/sourcegraph/internal/extsvc"
 	"github.com/sourcegraph/sourcegraph/internal/types"
 	"github.com/sourcegraph/sourcegraph/internal/types/typestest"
@@ -74,8 +79,10 @@ func testStoreChangesetSpecs(t *testing.T, ctx context.Context, s *Store, clock 
 	// listing or getting ChangesetSpecs, since we don't want to load
 	// ChangesetSpecs whose repository has been (soft-)deleted.
 	changesetSpecDeletedRepo := &btypes.ChangesetSpec{
-		UserID:      int32(424242),
-		Spec:        &batcheslib.ChangesetSpec{},
+		UserID: int32(424242),
+		Spec: &batcheslib.ChangesetSpec{
+			ExternalID: "123",
+		},
 		BatchSpecID: int64(424242),
 		RepoID:      deletedRepo.ID,
 	}
@@ -109,6 +116,12 @@ func testStoreChangesetSpecs(t *testing.T, ctx context.Context, s *Store, clock 
 
 			if diff := cmp.Diff(have, want); diff != "" {
 				t.Fatal(diff)
+			}
+
+			if typ, _, err := basestore.ScanFirstString(s.Query(ctx, sqlf.Sprintf("SELECT type FROM changeset_specs WHERE id = %d", have.ID))); err != nil {
+				t.Fatal(err)
+			} else if typ != string(btypes.ChangesetSpecTypeExisting) {
+				t.Fatalf("got incorrect changeset spec type %s", typ)
 			}
 		}
 	})
@@ -299,6 +312,39 @@ func testStoreChangesetSpecs(t *testing.T, ctx context.Context, s *Store, clock 
 				t.Fatalf("opts: %+v, diff: %s", opts, diff)
 			}
 		})
+
+		t.Run("OnlyUnmigrated", func(t *testing.T) {
+			// Expect all created from the time the flag was introduced are
+			// stored in the _new_ format already.
+			{
+				opts := ListChangesetSpecsOpts{RequiresMigration: true}
+				have, _, err := s.ListChangesetSpecs(ctx, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if len(have) != 0 {
+					t.Fatal("unmigrated records found")
+				}
+			}
+			if err := s.Exec(ctx, sqlf.Sprintf("UPDATE changeset_specs SET migrated = FALSE")); err != nil {
+				t.Fatal(err)
+			}
+
+			// Now all should be returned.
+			{
+				opts := ListChangesetSpecsOpts{RequiresMigration: true}
+				have, _, err := s.ListChangesetSpecs(ctx, opts)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				want := changesetSpecs
+				if diff := cmp.Diff(have, want); diff != "" {
+					t.Fatalf("opts: %+v, diff: %s", opts, diff)
+				}
+			}
+		})
 	})
 
 	t.Run("UpdateChangesetSpecBatchSpecID", func(t *testing.T) {
@@ -376,6 +422,7 @@ func testStoreChangesetSpecs(t *testing.T, ctx context.Context, s *Store, clock 
 				spec := &btypes.ChangesetSpec{
 					BatchSpecID: int64(i + 1),
 					RepoID:      repo.ID,
+					Spec:        &batcheslib.ChangesetSpec{ExternalID: "123"},
 				}
 				err := s.CreateChangesetSpec(ctx, spec)
 				if err != nil {
@@ -404,6 +451,9 @@ func testStoreChangesetSpecs(t *testing.T, ctx context.Context, s *Store, clock 
 				spec := &btypes.ChangesetSpec{
 					BatchSpecID: int64(i + 1),
 					RepoID:      repo.ID,
+					Spec: &batcheslib.ChangesetSpec{
+						ExternalID: "123",
+					},
 				}
 				err := s.CreateChangesetSpec(ctx, spec)
 				if err != nil {
@@ -454,6 +504,7 @@ func testStoreChangesetSpecs(t *testing.T, ctx context.Context, s *Store, clock 
 				// Need to set a RepoID otherwise GetChangesetSpec filters it out.
 				RepoID:    repo.ID,
 				CreatedAt: tc.createdAt,
+				Spec:      &batcheslib.ChangesetSpec{ExternalID: "123"},
 			}
 
 			if err := s.CreateChangesetSpec(ctx, changesetSpec); err != nil {
@@ -550,6 +601,7 @@ func testStoreChangesetSpecs(t *testing.T, ctx context.Context, s *Store, clock 
 				BatchSpecID: batchSpec.ID,
 				// Need to set a RepoID otherwise GetChangesetSpec filters it out.
 				RepoID:    repo.ID,
+				Spec:      &batcheslib.ChangesetSpec{ExternalID: "123"},
 				CreatedAt: tc.createdAt,
 			}
 
@@ -846,6 +898,140 @@ func testStoreChangesetSpecs(t *testing.T, ctx context.Context, s *Store, clock 
 		}
 		if have, want := len(conflicts), 0; have != want {
 			t.Fatalf("wrong number of conflicts. want=%d, have=%d", want, have)
+		}
+	})
+
+	t.Run("MigrateChangesetSpec", func(t *testing.T) {
+		spec := batcheslib.ChangesetSpec{
+			BaseRepository: string(relay.MarshalID("Repository", repo.ID)),
+			HeadRepository: string(relay.MarshalID("Repository", repo.ID)),
+			ExternalID:     "",
+			BaseRev:        "0xdeadbeef",
+			BaseRef:        "refs/heads/main",
+			HeadRef:        "refs/heads/test",
+			Title:          "Title",
+			Body:           "Body",
+			Commits: []batcheslib.GitCommitDescription{{
+				Message:     "Msg",
+				Diff:        "+ nice - bad",
+				AuthorName:  "Author",
+				AuthorEmail: "author@example.com",
+			}},
+			Published: batcheslib.PublishedValue{Val: true},
+		}
+		cs := &btypes.ChangesetSpec{
+			Spec:   &spec,
+			RepoID: repo.ID,
+		}
+		err := s.CreateChangesetSpec(ctx, cs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.MigrateChangesetSpec(ctx, cs); err != nil {
+			t.Fatal(err)
+		}
+		var (
+			externalID        string
+			headRef           string
+			title             string
+			headRepoID        int32
+			baseRev           string
+			baseRef           string
+			body              string
+			published         []byte
+			diff              string
+			commitMessage     string
+			commitAuthorName  string
+			commitAuthorEmail string
+			typ               string
+			migrated          bool
+		)
+		if err := s.query(ctx, sqlf.Sprintf(`
+SELECT
+	external_id,
+	head_ref,
+	title,
+	head_repo_id,
+	base_rev,
+	base_ref,
+	body,
+	published,
+	diff,
+	commit_message,
+	commit_author_name,
+	commit_author_email,
+	type,
+	migrated
+FROM
+	changeset_specs
+WHERE
+	id = %s
+		`, cs.ID), func(sc dbutil.Scanner) (err error) {
+			return sc.Scan(
+				&dbutil.NullString{S: &externalID},
+				&dbutil.NullString{S: &headRef},
+				&dbutil.NullString{S: &title},
+				&dbutil.NullInt32{N: &headRepoID},
+				&dbutil.NullString{S: &baseRev},
+				&dbutil.NullString{S: &baseRef},
+				&dbutil.NullString{S: &body},
+				&published,
+				&dbutil.NullString{S: &diff},
+				&dbutil.NullString{S: &commitMessage},
+				&dbutil.NullString{S: &commitAuthorName},
+				&dbutil.NullString{S: &commitAuthorEmail},
+				&dbutil.NullString{S: &typ},
+				&migrated,
+			)
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if want, have := "", externalID; want != have {
+			t.Errorf("invalid external_id after migration, want=%q have=%q", want, have)
+		}
+		if want, have := "refs/heads/test", headRef; want != have {
+			t.Errorf("invalid head_ref after migration, want=%q have=%q", want, have)
+		}
+		if want, have := "Title", title; want != have {
+			t.Errorf("invalid title after migration, want=%q have=%q", want, have)
+		}
+		if want, have := int32(repo.ID), headRepoID; want != have {
+			t.Errorf("invalid head_repo_id after migration, want=%d have=%d", want, have)
+		}
+		if want, have := "0xdeadbeef", baseRev; want != have {
+			t.Errorf("invalid base_rev after migration, want=%q have=%q", want, have)
+		}
+		if want, have := "refs/heads/main", baseRef; want != have {
+			t.Errorf("invalid base_ref after migration, want=%q have=%q", want, have)
+		}
+		if want, have := "Body", body; want != have {
+			t.Errorf("invalid body after migration, want=%q have=%q", want, have)
+		}
+		var pubVal batcheslib.PublishedValue
+		if err := json.Unmarshal(published, &pubVal); err != nil {
+			t.Fatal(err)
+		}
+		if want, have := true, pubVal.Val; want != have {
+			t.Errorf("invalid published after migration, want=%t have=%v", want, have)
+		}
+		if want, have := "+ nice - bad", diff; want != have {
+			t.Errorf("invalid diff after migration, want=%q have=%q", want, have)
+		}
+		if want, have := "Msg", commitMessage; want != have {
+			t.Errorf("invalid commit_message after migration, want=%q have=%q", want, have)
+		}
+		if want, have := "Author", commitAuthorName; want != have {
+			t.Errorf("invalid commit_author_name after migration, want=%q have=%q", want, have)
+		}
+		if want, have := "author@example.com", commitAuthorEmail; want != have {
+			t.Errorf("invalid commit_author_email after migration, want=%q have=%q", want, have)
+		}
+		if want, have := string(btypes.ChangesetSpecTypeBranch), typ; want != have {
+			t.Errorf("invalid type after migration, want=%q have=%q", want, have)
+		}
+		if want, have := true, migrated; want != have {
+			t.Errorf("invalid migrated after migration, want=%t have=%t", want, have)
 		}
 	})
 }
