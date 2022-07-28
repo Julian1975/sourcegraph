@@ -24,7 +24,7 @@ All notable changes to Sourcegraph are documented in this file.
 
 ### Changed
 
-- Custom Git fetch configuration `experimentalFeatures.customGitFetch` now requires the environment variable `INSECURE_ENABLE_CUSTOM_GIT_FETCH` to be set to `true` to enable.
+- Custom Git fetch configuration `experimentalFeatures.customGitFetch` now requires the environment variable `INSECURE_ENABLE_CUSTOM_GIT_FETCH` to be set to `true` to enable. [#39630](https://github.com/sourcegraph/sourcegraph/pull/39630)
 
 ### Fixed
 
