@@ -2,10 +2,15 @@ package cliutil
 
 import (
 	"github.com/sourcegraph/sourcegraph/internal/database/migration/definition"
+	"github.com/sourcegraph/sourcegraph/internal/database/migration/schemas"
+	"github.com/sourcegraph/sourcegraph/internal/database/migration/stitch"
 	"github.com/sourcegraph/sourcegraph/internal/oobmigration"
 )
 
 type upgradePlan struct {
+	// the source and target instance versions
+	from, to oobmigration.Version
+
 	// the stitched schema migration definitions over the entire version range by schema name
 	stitchedDefinitionsBySchemaName map[string]*definition.Definitions
 
@@ -92,7 +97,29 @@ func planUpgrade(versionRange []oobmigration.Version) (upgradePlan, error) {
 	})
 
 	return upgradePlan{
+		from:                            from,
+		to:                              to,
 		stitchedDefinitionsBySchemaName: stitchedDefinitionsBySchemaName,
 		steps:                           steps,
 	}, nil
+}
+
+// filterStitchedMigrationsForTags returns a copy of the pre-compiled stitchedMap with references
+// to tags outside of the given set removed. This allows a migrator instance that knows the upgrade
+// path from X -> Y to also know the path from any partial upgrade X <= W -> Z <= Y.
+func filterStitchedMigrationsForTags(tags []string) (map[string]stitch.StitchedMigration, error) {
+	stitchedMigrationBySchemaName := make(map[string]stitch.StitchedMigration, len(schemas.SchemaNames))
+	for _, schemaName := range schemas.SchemaNames {
+		leafIDsByRev := make(map[string][]int, len(tags))
+		for _, tag := range tags {
+			leafIDsByRev[tag] = stitchedMigationsBySchemaName[schemaName].LeafIDsByRev[tag]
+		}
+
+		stitchedMigrationBySchemaName[schemaName] = stitch.StitchedMigration{
+			Definitions:  stitchedMigationsBySchemaName[schemaName].Definitions,
+			LeafIDsByRev: leafIDsByRev,
+		}
+	}
+
+	return stitchedMigrationBySchemaName, nil
 }

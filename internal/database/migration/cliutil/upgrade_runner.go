@@ -5,6 +5,8 @@ import (
 
 	"github.com/sourcegraph/sourcegraph/internal/database/migration/runner"
 	"github.com/sourcegraph/sourcegraph/internal/database/migration/schemas"
+	"github.com/sourcegraph/sourcegraph/internal/oobmigration"
+	"github.com/sourcegraph/sourcegraph/internal/version/upgradestore"
 	"github.com/sourcegraph/sourcegraph/lib/errors"
 )
 
@@ -23,6 +25,34 @@ func runUpgrade(ctx context.Context, runnerFactory RunnerFactoryWithSchemas, pla
 	if err != nil {
 		return err
 	}
+
+	//
+	//
+	//
+
+	db, err := extractDatabase(ctx, r)
+	if err != nil {
+		return err
+	}
+	versionStr, ok, err := upgradestore.New(db).GetServiceVersion(ctx, "frontend")
+	if err != nil {
+		return err
+	}
+	if !ok {
+		// TODO - better error condition
+		return errors.New("fresh instance")
+	}
+	version, ok := oobmigration.NewVersionFromString(versionStr)
+	if !ok {
+		return errors.Newf("cannot parse version: %q", versionStr)
+	}
+	if oobmigration.CompareVersions(version, plan.to) != oobmigration.VersionOrderEqual {
+		return errors.Newf("version assertion failed: %q != %q", version, plan.to)
+	}
+
+	//
+	//
+	//
 
 	for _, step := range plan.steps {
 		operations := make([]runner.MigrationOperation, 0, len(step.schemaMigrationLeafIDsBySchemaName))
