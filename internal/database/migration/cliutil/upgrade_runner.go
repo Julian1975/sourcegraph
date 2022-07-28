@@ -44,10 +44,12 @@ func runUpgrade(ctx context.Context, runnerFactory RunnerFactoryWithSchemas, pla
 	}
 	version, ok := oobmigration.NewVersionFromString(versionStr)
 	if !ok {
+		// TODO - better error condition
 		return errors.Newf("cannot parse version: %q", versionStr)
 	}
-	if oobmigration.CompareVersions(version, plan.to) != oobmigration.VersionOrderEqual {
-		return errors.Newf("version assertion failed: %q != %q", version, plan.to)
+	if oobmigration.CompareVersions(version, plan.from) != oobmigration.VersionOrderEqual {
+		// TODO - better error condition
+		return errors.Newf("version assertion failed: %q != %q", version, plan.from)
 	}
 
 	//
