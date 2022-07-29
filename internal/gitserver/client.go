@@ -57,7 +57,6 @@ var (
 
 var ClientMocks, emptyClientMocks struct {
 	GetObject               func(repo api.RepoName, objectName string) (*gitdomain.GitObject, error)
-	RepoInfo                func(ctx context.Context, repos ...api.RepoName) (*protocol.RepoInfoResponse, error)
 	Archive                 func(ctx context.Context, repo api.RepoName, opt ArchiveOptions) (_ io.ReadCloser, err error)
 	LocalGitserver          bool
 	LocalGitCommandReposDir string
@@ -222,6 +221,8 @@ type Client interface {
 	// repo name using the Rendezvous hashing scheme.
 	RendezvousAddrForRepo(api.RepoName) string
 
+	RepoCloneProgress(context.Context, ...api.RepoName) (*protocol.RepoCloneProgressResponse, error)
+
 	// ResolveRevision will return the absolute commit for a commit-ish spec. If spec is empty, HEAD is
 	// used.
 	//
@@ -235,15 +236,6 @@ type Client interface {
 	// ResolveRevisions expands a set of RevisionSpecifiers (which may include hashes, globs, refs, or glob exclusions)
 	// into an equivalent set of commit hashes
 	ResolveRevisions(_ context.Context, repo api.RepoName, _ []protocol.RevisionSpecifier) ([]string, error)
-
-	// RepoInfo retrieves information about one or more repositories on gitserver.
-	//
-	// The repository not existing is not an error; in that case, RepoInfoResponse.Results[i].Cloned
-	// will be false and the error will be nil.
-	//
-	// If multiple errors occurred, an incomplete result is returned along with an
-	// error.errors.
-	RepoInfo(context.Context, ...api.RepoName) (*protocol.RepoInfoResponse, error)
 
 	// ReposStats will return a map of the ReposStats for each gitserver in a
 	// map. If we fail to fetch a stat from a gitserver, it won't be in the
@@ -1043,35 +1035,28 @@ func (e *RepoNotCloneableErr) Error() string {
 	return fmt.Sprintf("repo not found (name=%s notfound=%v) because %s", e.repo, e.notFound, e.reason)
 }
 
-func (c *clientImplementor) RepoInfo(ctx context.Context, repos ...api.RepoName) (*protocol.RepoInfoResponse, error) {
-	if ClientMocks.RepoInfo != nil {
-		return ClientMocks.RepoInfo(ctx, repos...)
-	}
+func (c *clientImplementor) RepoCloneProgress(ctx context.Context, repos ...api.RepoName) (*protocol.RepoCloneProgressResponse, error) {
+	numPossibleShards := len(c.Addrs())
+	shards := make(map[string]*protocol.RepoCloneProgressRequest, (len(repos)/numPossibleShards)*2) // 2x because it may not be a perfect division
 
-	totalShards := len(c.Addrs())
-	shards := make(map[string]*protocol.RepoInfoRequest, totalShards)
-
-	// Build a map of each shards -> [list of repos that belong to that shard]. We do this so that
-	// we can send only one request with the entire list of repos for that shard. This allows us to
-	// get away with making only N HTTP requests, where N is the total number of shards.
 	for _, r := range repos {
 		addr, err := c.AddrForRepo(ctx, r)
 		if err != nil {
 			return nil, err
 		}
+		shard := shards[addr]
 
-		repoInfoReq := shards[addr]
-		if repoInfoReq == nil {
-			repoInfoReq = new(protocol.RepoInfoRequest)
-			shards[addr] = repoInfoReq
+		if shard == nil {
+			shard = new(protocol.RepoCloneProgressRequest)
+			shards[addr] = shard
 		}
 
-		repoInfoReq.Repos = append(repoInfoReq.Repos, r)
+		shard.Repos = append(shard.Repos, r)
 	}
 
 	type op struct {
-		req *protocol.RepoInfoRequest
-		res *protocol.RepoInfoResponse
+		req *protocol.RepoCloneProgressRequest
+		res *protocol.RepoCloneProgressResponse
 		err error
 	}
 
@@ -1079,7 +1064,7 @@ func (c *clientImplementor) RepoInfo(ctx context.Context, repos ...api.RepoName)
 	for _, req := range shards {
 		go func(o op) {
 			var resp *http.Response
-			resp, o.err = c.httpPost(ctx, o.req.Repos[0], "repos", o.req)
+			resp, o.err = c.httpPost(ctx, o.req.Repos[0], "repo-clone-progress", o.req)
 			if o.err != nil {
 				ch <- o
 				return
@@ -1087,39 +1072,24 @@ func (c *clientImplementor) RepoInfo(ctx context.Context, repos ...api.RepoName)
 
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
-				msg := fmt.Sprintf("RepoInfo: http status code: %d", resp.StatusCode)
-				content, err := io.ReadAll(resp.Body)
-				if err != nil {
-					msg = fmt.Sprintf("%s, failed to read response body, error: %v", msg, err)
-				}
-
-				// strings.TrimSpace is needed to remove trailing \n characters that is added by the
-				// server. We use http.Error in the server which in turn uses fmt.Fprintln to format
-				// the error message. And in translation that newline gets escapted into a \n
-				// character.  For what the error message would look in the UI without
-				// strings.TrimSpace, see attached screenshots in this pull request:
-				// https://github.com/sourcegraph/sourcegraph/pull/39358.
-				msg = fmt.Sprintf("%s, reason: %q", msg, strings.TrimSpace(string(content)))
-
 				o.err = &url.Error{
 					URL: resp.Request.URL.String(),
-					Op:  "RepoInfo",
-					Err: errors.New(msg),
+					Op:  "RepoCloneProgress",
+					Err: errors.Errorf("RepoCloneProgress: http status %d", resp.StatusCode),
 				}
-
 				ch <- o
 				return // we never get an error status code AND result
 			}
 
-			o.res = new(protocol.RepoInfoResponse)
+			o.res = new(protocol.RepoCloneProgressResponse)
 			o.err = json.NewDecoder(resp.Body).Decode(o.res)
 			ch <- o
 		}(op{req: req})
 	}
 
 	var err error
-	res := protocol.RepoInfoResponse{
-		Results: make(map[api.RepoName]*protocol.RepoInfo),
+	res := protocol.RepoCloneProgressResponse{
+		Results: make(map[api.RepoName]*protocol.RepoCloneProgress),
 	}
 
 	for i := 0; i < cap(ch); i++ {
