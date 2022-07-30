@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -47,6 +49,114 @@ func TestEnsureSchemaTable(t *testing.T) {
 		t.Fatalf("expected method to be idempotent, got error: %s", err)
 	}
 }
+
+func TestBackfillSchemaVersions(t *testing.T) {
+	test := func(t *testing.T, schemaName string, version int, expectedVersions []int, f func(ctx context.Context, store *Store)) {
+		logger := logtest.Scoped(t)
+		db := dbtest.NewDB(logger, t)
+		store := testStoreWithName(db, schemaName)
+		ctx := context.Background()
+
+		// TODO - document
+		if err := store.EnsureSchemaTable(ctx); err != nil {
+			t.Fatalf("unexpected error ensuring schema table exists: %s", err)
+		}
+
+		// TODO - document
+		f(ctx, store)
+
+		// TODO - document
+		if err := store.BackfillSchemaVersions(ctx); err != nil {
+			t.Fatalf("unexpected error backfilling schema table: %s", err)
+		}
+
+		// TODO - document
+		appliedVersions, _, _, err := store.Versions(ctx)
+		if err != nil {
+			t.Fatalf("unexpected error querying versions: %s", err)
+		}
+		if diff := cmp.Diff(expectedVersions, appliedVersions); diff != "" {
+			t.Errorf("unexpected applied migrations (-want +got):\n%s", diff)
+		}
+	}
+
+	testViaGolangMigrate := func(t *testing.T, schemaName string, version int, expectedVersions []int) {
+		// TODO - extract
+		setup := func(ctx context.Context, store *Store) {
+			// TODO - document
+			tableName := sqlf.Sprintf(tableizeSchemaName(schemaName))
+
+			// TODO - document
+			if err := store.Exec(ctx, sqlf.Sprintf(`CREATE TABLE %s (version text, dirty bool)`, tableName)); err != nil {
+				t.Fatalf("unexpected error TODO: %s", err)
+			}
+			if err := store.Exec(ctx, sqlf.Sprintf(`INSERT INTO %s VALUES (%s, false)`, tableName, strconv.Itoa(version))); err != nil {
+				t.Fatalf("unexpected error TODO: %s", err)
+			}
+		}
+		test(t, schemaName, version, expectedVersions, setup)
+	}
+
+	testViaMigrationLogs := func(t *testing.T, schemaName string, version int, expectedVersions []int) {
+		// TODO - extract
+		setup := func(ctx context.Context, store *Store) {
+			// TODO - document
+			if err := store.Exec(ctx, sqlf.Sprintf(`INSERT INTO migration_logs (
+				migration_logs_schema_version,
+				schema,
+				version,
+				up,
+				started_at,
+				finished_at,
+				success
+			) VALUES (%s, %s, %s, true, NOW(), NOW(), true)`,
+				currentMigrationLogSchemaVersion,
+				schemaName,
+				version,
+			)); err != nil {
+				t.Fatalf("unexpected error inserting data: %s", err)
+			}
+		}
+		test(t, schemaName, version, expectedVersions, setup)
+	}
+
+	// TODO - rename
+	fx := func(a, b int) []int {
+		vs := make([]int, 0, b-a+2)
+		vs = append(vs, -a)
+		for i := a; i <= b; i++ {
+			vs = append(vs, i)
+		}
+		return vs
+	}
+
+	// TODO - break this apart to enable these tests
+
+	for i, f := range []func(*testing.T, string, int, []int){
+		testViaMigrationLogs,
+		testViaGolangMigrate,
+	} {
+		name := fmt.Sprintf("frontend-%d", i) // TODO
+		t.Run(name, func(t *testing.T) {
+			f(t, "frontend", 1528395834, fx(1528395787, 1528395834)) // squashed root
+			// f(t, "frontend", 1528395840, fx(1528395787, 1528395840)) // non-squashed migration
+		})
+
+		name = fmt.Sprintf("codeintel-%d", i) // TODO
+		t.Run(name, func(t *testing.T) {
+			f(t, "codeintel", 1000000015, fx(1000000005, 1000000015)) // squashed root
+			// f(t, "codeintel", 1000000020, fx(1000000005, 1000000020)) // non-squashed migration
+		})
+
+		name = fmt.Sprintf("codeinsights-%d", i) // TODO
+		t.Run(name, func(t *testing.T) {
+			f(t, "codeinsights", 1000000020, fx(1000000000, 1000000020)) // squashed root
+			// f(t, "codeinsights", 1000000027, fx(1000000000, 1000000027)) // non-squashed migration
+		})
+	}
+}
+
+// TODO - add test for humanize, etc
 
 func TestVersions(t *testing.T) {
 	logger := logtest.Scoped(t)
